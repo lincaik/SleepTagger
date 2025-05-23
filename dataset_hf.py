@@ -21,12 +21,12 @@ class EarVASDatasetFromHF(Dataset):
     def extract_mel(self, y, path=None, sr=16000): # 🎧 audio，梅尔频谱提取与标准化，含异常检测和填充/截断逻辑
         if not isinstance(y, np.ndarray): # 存在异常样本：单声道
             self.counter += 1
-            print(f"[{self.counter}] ⚠️ [extract_mel] 非法输入类型: {type(y)} | 文件路径: {path}") # 有75个audio，出现在home/v-wangzeyu/skywang/DreamCatcher_cropped/data/test/breathe
+            # print(f"[{self.counter}] ⚠️ [extract_mel] 非法输入类型: {type(y)} | 文件路径: {path}") # 有75个audio，出现在home/v-wangzeyu/skywang/DreamCatcher_cropped/data/test/breathe
             return np.zeros((self.n_mels, self.target_time_frames), dtype=np.float32)  # 返回默认特征 
 
         if len(y) < 400:  # 存在异常样本：原始音频波形长度太短，连最小的 Mel 频谱都无法计算（librosa 直接报错）
         # 处理过短音频（<400采样点时生成全零频谱）
-            print(f"[{self.counter}] ⚠️ [extract_mel] 太短了: len(y) = {len(y)} | 文件路径: {path}")
+            # print(f"[{self.counter}] ⚠️ [extract_mel] 太短了: len(y) = {len(y)} | 文件路径: {path}")
             return np.zeros((self.n_mels, self.target_time_frames), dtype=np.float32) # 全 0 的 Mel 频谱张量，shape 是 (128, 512)（频率 × 时间帧）
 
         # 将双通道音频转换为梅尔频谱图

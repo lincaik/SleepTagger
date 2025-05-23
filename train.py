@@ -26,6 +26,32 @@ import time
 import torch.multiprocessing as mp 
 
 import random
+
+# ========= 配置区域 =========
+use_freRA_in_train = True 
+batch_size = 128  
+num_epochs = 15
+return_alpha = True # 是否返回 alpha 分数
+
+# Early Stopping 配置
+early_stop_patience = 5           # 忍耐轮数
+warmup_epochs = 10                # 前几轮不判断早停
+
+# ========= 初始化，基本不用改动 =========
+# Early Stopping 相关
+val_loss_history = []            # 存放最近 val loss
+max_history = early_stop_patience
+no_improve_epochs = 0            # 未改善计数器
+
+# 与训练无关
+timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M") # 获取当前时间作为子文件夹，例如 '2025-05-09_0320'
+save_dir = os.path.join('model', 'earvas_self', timestamp) # 创建带时间戳的保存目录
+
+PROJECT_ROOT = os.environ.get("PROJECT_ROOT", None)
+if not PROJECT_ROOT:
+    PROJECT_ROOT = os.path.abspath(".")
+#=========
+
 def set_seed(seed=42):
     random.seed(seed)                          # Python 原生随机数
     np.random.seed(seed)                       # NumPy 随机数
@@ -43,6 +69,7 @@ def main():
 # 加载数据集
     print("\n==================== 加载 HF 数据集 ====================")
     dataset = load_dataset("THU-PI-Sensing/DreamCatcher", "sleep_event_classification", trust_remote_code=True)
+    label_names = dataset["train"].features["label"].names
     # train_dataset = EarVASDatasetFromHF(dataset["train"]) 
     # val_dataset = EarVASDatasetFromHF(dataset["validation"])
     # test_dataset = EarVASDatasetFromHF(dataset["test"])
@@ -58,7 +85,7 @@ def main():
     # 提前挪到本地 SSD，减少 NFS 读取时间【好像效果不大】
     # if "TMPDIR" in os.environ: # 检查是否在 GLab 环境（是否有本地 SSD 临时目录）
     #     tmp_data_root = os.environ["TMPDIR"]
-    #     tmp_data_dir = os.path.join(tmp_data_root, "preprocessed_DC")
+    #     tmp_data_dir = os.path.join(PROJECT_ROOT, tmp_data_root, "preprocessed_DC")
 
     #     if not os.path.exists(tmp_data_dir):
     #         print(f"📦 复制预处理数据到本地 SSD: {tmp_data_dir}（这可能需要几分钟）")
@@ -71,7 +98,7 @@ def main():
     #     tmp_data_dir = "preprocessed_DC"
     #     print("⚠️ 未检测到 TMPDIR，仍然使用 NFS 目录") 
     # 使用本地路径构造 Dataset  ✅ 针对lazy_split
-    # preprocesssed_data_dir = os.path.join(tmp_data_dir, "1")  # 注意 原始目录结构是 preprocessed_DC/1
+    # preprocesssed_data_dir = os.path.join(PROJECT_ROOT, tmp_data_dir, "1")  # 注意 原始目录结构是 preprocessed_DC/1
 
     # 针对dataset_cached
     # train_dataset = CachedEarVASDataset(preprocesssed_data_dir, "train") # 使用缓存数据集
@@ -87,14 +114,14 @@ def main():
     print("\n==================== 构建PyTorch Dataset 和 DataLoader ====================")
     train_loader = DataLoader(
         train_dataset,
-        batch_size=128,
+        batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,     # 使用 CPU 核心数的一半
         pin_memory=True
     ) 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=128, # 64,   # 你可以设置等于训练 batch_size
+        batch_size=batch_size, # 64,   # 你可以设置等于训练 batch_size
         num_workers=num_workers,
         pin_memory=True
     )
@@ -114,16 +141,11 @@ def main():
 # 初始化
     print("\n==================== 初始化设备和模型 ====================")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = EarVAS(num_classes=9, use_freRA=False).to(device)     # ✅ 使用自制 EarVAS 模型
+    model = EarVAS(num_classes=9, use_freRA=use_freRA_in_train).to(device)     # ✅ 使用自制 EarVAS 模型
     # 返回的是一个 PyTorch 模型对象，继承自 torch.nn.Module, 构造了一个神经网络结构图
     # 将模型移动到指定设备
     print("✅ 当前设备：", device)
     print("✅ 模型设备：", next(model.parameters()).device)
-
-    # 检查 freRA 参数是否在模型中
-    for name, param in model.named_parameters():
-        if "freRA.s" in name:
-            print(f"🎯 FreRA 参数参与训练: {name}, shape: {param.shape}")
 
     # ✅ 损失函数 & 优化器
     criterion = nn.CrossEntropyLoss()
@@ -138,14 +160,46 @@ def main():
         print("evaluate_model 模型当前所在设备：", next(model.parameters()).device)
         all_preds, all_labels = [], []
 
+        total_loss = 0.0
         for step, (audio, imu, labels) in enumerate(val_loader):
             # if step >= 30: # 👈 只跑前 3 个 batch, 以便debug
             #     break   
-            audio, imu = audio.to(device), imu.to(device)
-            outputs = model(audio, imu)
+            audio, imu, labels = audio.to(device), imu.to(device), labels.to(device)
+
+            # # ✅ 只在第一个 batch 分析模态范数差异
+            # if step == 0:
+            #     try:
+            #         # Audio 特征
+            #         audio_feat = model.audio_model(audio)
+            #         audio_feat = model.audio_proj(audio_feat)
+
+            #         # IMU 特征
+            #         if hasattr(model, "freRA") and model.use_freRA:
+            #             imu = model.freRA(imu)
+            #         imu_feat = model.imu_branch(imu)
+
+            #         audio_norm = audio_feat.norm(dim=1)
+            #         imu_norm = imu_feat.norm(dim=1)
+
+            #         print(f"\n🎧 audio_feat mean norm: {audio_norm.mean().item():.4f}")
+            #         print(f"📈 imu_feat mean norm:   {imu_norm.mean().item():.4f}")
+            #         print(f"📏 平均差值:             {(audio_norm.mean() - imu_norm.mean()).item():.4f}")
+            #         print(f"📏 平均绝对差（样本级）: {(audio_norm - imu_norm).abs().mean().item():.4f}")
+            #     except Exception as e:
+            #         print("⚠️ 模态范数分析失败：", e)
+
+            # 正常推理
+            outputs, alpha = model(audio, imu, return_alpha=return_alpha) # outputs = model(audio, imu)
             preds = torch.argmax(outputs, dim=1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
+            # 为了早停而计算loss
+            loss = criterion(outputs, labels)  
+            total_loss += loss.item()
+
+            # 每个 epoch 只打印一次 alpha 分布（第一个 batch）
+            if step == 0:
+                print(f"📊 alpha: mean={alpha.mean():.4f}, min={alpha.min():.4f}, max={alpha.max():.4f}")
         print("evaluate_model 内循环完了")
 
         acc = accuracy_score(all_labels, all_preds)
@@ -156,6 +210,7 @@ def main():
         labels = list(range(num_classes))
         cm = confusion_matrix(all_labels, all_preds, labels=labels)
 
+        avg_val_loss = total_loss / len(val_loader)   # 为了早停 新增
         # 🎯 Macro-AUC
         try:
             y_true_bin = label_binarize(all_labels, classes=list(range(num_classes)))
@@ -169,20 +224,19 @@ def main():
             "f1": f1,
             "confusion_matrix": cm,
             "mcc": mcc,
-            "auc": auc
+            "auc": auc,
+            "val_loss": avg_val_loss               # 👈 新增
         }
-
-    # ✅ 训练参数
-    num_epochs = 10 # 10  #5
-    best_f1 = 0.0 
-    best_acc = 0.0
-
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")    # 获取当前时间作为子文件夹，例如 '2025-05-09_0320'
+ 
 
 # 如果想只用test，注释掉这部分-----
-    # 创建带时间戳的保存目录
-    save_dir = os.path.join('model', 'earvas_self', timestamp)
-    os.makedirs(save_dir, exist_ok=True)
+    # 找最佳模型
+    best_f1 = 0.0
+    best_acc = 0.0
+    best_val_loss = float("inf") 
+    
+    dirs = os.path.join(PROJECT_ROOT, save_dir)
+    os.makedirs(dirs, exist_ok=True)
 
     # ✅ 开始训练循环
     print("\n==================== 进入train ====================")
@@ -232,16 +286,20 @@ def main():
         # ✅ 验证集评估
         results = evaluate_model(model, val_loader, device)
         acc, f1, cm = results["accuracy"], results["f1"], results["confusion_matrix"]
+        df_cm = pd.DataFrame(cm, index=label_names, columns=label_names)
             
         print(f"[Epoch {epoch+1}] 🎯 Accuracy: {acc:.4f} | F1: {f1:.4f}")
         print(f"[Epoch {epoch+1}] 📊 Confusion Matrix:\n{cm}")
 
+        val_loss = results.get("val_loss", 0)   # 为了早停 初始化
+        
         # ✅ 保存最佳模型
         if f1 > best_f1: # 以f1为准
             best_f1 = f1
         # if acc > best_acc: # 以acc为准
             # best_acc = acc
-            save_path = os.path.join(save_dir, f"epoch{epoch+1}_f1_{f1:.4f}_acc_{acc:.4f}.pt")
+            no_improve_epochs = 0 
+            save_path = os.path.join(PROJECT_ROOT, save_dir, f"epoch{epoch+1}_f1_{f1:.4f}_acc_{acc:.4f}.pt")
             torch.save({
                 'epoch': epoch,
                 'model_state': model.state_dict(),
@@ -250,9 +308,30 @@ def main():
                 'accuracy': acc
             }, save_path)
             print(f"💾 Saved best model at epoch {epoch+1} with F1 = {f1:.4f}, accuracy = {acc:.4f}")
+        else:
+            # 本次模型效果下降
+            no_improve_epochs += 1
+            print(f"[Epoch {epoch+1}] ❌ F1无提升（+{f1 - best_f1:.4f}），忍耐计数: {no_improve_epochs}/{early_stop_patience}")
+
+            # Early stopping 判断（跳过 warmup）
+            if epoch + 1 <= warmup_epochs: 
+                print(f"[Epoch {epoch+1}] ⏳ Warmup中，不判断早停")
+                continue
+
+            # ➕ 记录 val_loss 趋势
+            val_loss_history.append(val_loss)
+            if len(val_loss_history) > max_history:
+                val_loss_history.pop(0) 
+            
+            if val_loss < best_val_loss - 1e-6:
+                best_val_loss = val_loss # 以整个训练过程的最小 loss 为最佳。
+            # 🎯 Early stop 条件：F1 连续不提升 + val_loss 上升
+            if no_improve_epochs >= early_stop_patience and all(x >= best_val_loss for x in val_loss_history):
+                print("⏹️ Early stopping: F1 无改善，且 val_loss 持续未下降")
+                break
 # ---
     print("\n==================== 进入test ====================")
-    test_loader = DataLoader(test_dataset, batch_size=128)  # 32
+    test_loader = DataLoader(test_dataset, batch_size=batch_size)  # 32
 
     def safe_load_model(model, path, device="cpu"):
         try: # 尝试直接加载为 state_dict
@@ -272,12 +351,12 @@ def main():
 
     # ✅ 加载最优模型
     # model_path = "epoch7_f1_0.4924_acc_0.7277.pt"
-    # save_path = os.path.join('model/earvas_self/2025-05-09_0522', model_path)
+    # save_path = os.path.join(PROJECT_ROOT, 'model/earvas_self/2025-05-09_0522', model_path)
     print(f"\n==================== 加载最优模型 echo总次数:{num_epochs} 模型名称:{save_path}====================")
-    print("🔥 PyTorch 编译时用的 CUDA 版本", torch.version.cuda) # PyTorch 编译时用的 CUDA 版本
-    print("🔥 是否检测到 GPU:", torch.cuda.is_available())
-    print("🔥 当前可用 GPU 数量:", torch.cuda.device_count())
-    print("🔥 当前使用设备:", device)
+    # print("🔥 PyTorch 编译时用的 CUDA 版本", torch.version.cuda) # PyTorch 编译时用的 CUDA 版本
+    # print("🔥 是否检测到 GPU:", torch.cuda.is_available())
+    # print("🔥 当前可用 GPU 数量:", torch.cuda.device_count())
+    # print("🔥 当前使用设备:", device)
 
     model = safe_load_model(model, save_path, device)
     model.to(device)
@@ -296,6 +375,8 @@ def main():
     print("\n==================== 测试的评估 ing ====================") 
     results = evaluate_model(model, test_loader, device)
 
+    df_cm = pd.DataFrame(results['confusion_matrix'], index=label_names, columns=label_names)
+
     print("\n==================== 🧪 Final Evaluation ====================")
     print(f"{save_path}\n")
     print(f"🎯 Accuracy:   {results['accuracy']:.4f}")
@@ -304,13 +385,14 @@ def main():
     print(f"🎯 MCC:        {results['mcc']:.4f}")
     print(f"🧮 FLOPs:      {flops.total() / 1e9:.2f} GFLOPs")
     print(f"🧮 Params:     {params / 1e6:.2f} M")
-    print(f"📊 Test Confusion Matrix:\n{results['confusion_matrix']}")
+    print(f"📊 Test Confusion Matrix:\n{df_cm}")
 
     # 保存 confusion matrix
-    df_cm = pd.DataFrame(results['confusion_matrix'], index=range(9), columns=range(9))
-    df_cm.to_csv("confusion_matrix.csv", index=True)
+    confusion_csv_path = os.path.join(PROJECT_ROOT, "confusion_matrix.csv")
+    df_cm.to_csv(confusion_csv_path, index=True)
     # 保存评估指标
-    with open("metrics.txt", "a") as f:
+    metrics_path = os.path.join(PROJECT_ROOT, "metrics.txt")
+    with open(metrics_path, "a") as f:
         f.write(f"{save_path}\n")
         f.write(f"Accuracy:   {results['accuracy']:.4f}\n")
         f.write(f"Macro-AUC:  {results['auc']:.4f}\n")
@@ -318,11 +400,12 @@ def main():
         f.write(f"MCC:        {results['mcc']:.4f}\n")
         f.write(f"FLOPs:      {flops.total() / 1e9:.2f} GFLOPs\n")
         f.write(f"Params:     {params / 1e6:.2f} M\n")
+        f.write(f"Confusion Matrix:\n{df_cm.to_string()}\n")
 
 if __name__ == "__main__":  
     print("\n==================== 开始后台监控 ====================") 
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M") # 获取当前时间作为子文件夹，例如 '2025-05-09_0320'
-    monitor_process = multiprocessing.Process(target=monitor_system, args=(60, f"monitor_log/monitor_log_{timestamp}.txt")) # 每 60 秒记录一次状态
+    MONITOR_FILE = os.path.join(PROJECT_ROOT, f"monitor_log/monitor_log_{timestamp}.txt")
+    monitor_process = multiprocessing.Process(target=monitor_system, args=(60, MONITOR_FILE )) # 每 60 秒记录一次状态
     monitor_process.start()
 
     try: 
